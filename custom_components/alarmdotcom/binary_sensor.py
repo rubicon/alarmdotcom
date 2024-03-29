@@ -1,226 +1,250 @@
 """Alarmdotcom implementation of an HA binary sensor."""
+
 from __future__ import annotations
 
-from enum import Enum
 import logging
 import re
-from typing import Any
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any, Final
 
 from homeassistant import core
-from homeassistant.components.binary_sensor import BinarySensorDeviceClass as bsdc
-from homeassistant.components.binary_sensor import BinarySensorEntity
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+    BinarySensorEntityDescription,
+)
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.entity_platform import DiscoveryInfoType
-from pyalarmdotcomajax.entities import ADCSensor
-from pyalarmdotcomajax.entities import ADCSensorSubtype
+from homeassistant.const import EntityCategory
+from homeassistant.helpers.entity_platform import AddEntitiesCallback, DiscoveryInfoType
+from pyalarmdotcomajax.devices.registry import AllDevices_t
+from pyalarmdotcomajax.devices.sensor import Sensor as libSensor
+from pyalarmdotcomajax.devices.water_sensor import WaterSensor as libWaterSensor
 
-from . import ADCIEntity
-from . import const as adci
-from .controller import ADCIController
-from .device_type_langs import LANG_DOOR
-from .device_type_langs import LANG_WINDOW
+from .base_device import AttributeBaseDevice, BaseDevice, HardwareBaseDevice
+from .const import DATA_CONTROLLER, DOMAIN, SENSOR_SUBTYPE_BLACKLIST
+from .controller import AlarmIntegrationController
+from .device_type_langs import LANG_DOOR, LANG_WINDOW
 
-log = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class AlarmdotcomAttributeDescriptionMixin:
+    """Functions for an attribute entity."""
+
+    value_fn: Callable[[BaseDevice], bool | None]
+    filter_fn: Callable[[AllDevices_t], bool]
+    extra_attribs_fn: Callable[[BaseDevice], dict | None]
+
+
+@dataclass
+class AlarmdotcomAttributeDescription(BinarySensorEntityDescription, AlarmdotcomAttributeDescriptionMixin):  # type: ignore
+    """Describes an attribute entity."""
+
+
+ATTRIBUTE_BINARY_SENSORS: Final = [
+    AlarmdotcomAttributeDescription(
+        key="malfunction",
+        name="Malfunction",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        has_entity_name=True,
+        extra_attribs_fn=lambda device: {},
+        value_fn=lambda device: device.malfunction,
+        filter_fn=lambda device: device.malfunction is not None,
+    ),
+    AlarmdotcomAttributeDescription(
+        key="battery",
+        name="Battery",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=BinarySensorDeviceClass.BATTERY,
+        has_entity_name=True,
+        extra_attribs_fn=lambda device: {"battery_level": device.battery_level},
+        value_fn=lambda device: device.battery_alert,
+        filter_fn=lambda device: device.battery_critical is not None and device.battery_low is not None,
+    ),
+]
 
 
 async def async_setup_entry(
     hass: core.HomeAssistant,
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
+    discovery_info: DiscoveryInfoType | None = None,  # pylint: disable=unused-argument
 ) -> None:
     """Set up the sensor platform."""
 
-    controller: ADCIController = hass.data[adci.DOMAIN][config_entry.entry_id]
-
     # Create "real" Alarm.com sensors.
+    controller: AlarmIntegrationController = hass.data[DOMAIN][config_entry.entry_id][DATA_CONTROLLER]
+
     async_add_entities(
-        ADCIBinarySensor(controller, controller.devices.get("entity_data", {}).get(sensor_id))  # type: ignore
-        for sensor_id in controller.devices.get("sensor_ids", [])
+        BinarySensor(
+            controller=controller,
+            device=device,
+        )
+        for device in [*controller.api.devices.sensors.values(), *controller.api.devices.water_sensors.values()]
+        if device.device_subtype not in SENSOR_SUBTYPE_BLACKLIST and device.has_state
     )
 
-    # Create "virtual" low battery sensors for Alarm.com sensors and locks.
+    # Create "virtual" low battery and malfunction sensors.
+
     async_add_entities(
-        ADCIBatterySensor(controller, controller.devices.get("entity_data", {}).get(battery_id))  # type: ignore
-        for battery_id in controller.devices.get("low_battery_ids", [])
+        AttributeBinarySensor(
+            controller=controller,
+            device=device,
+            description=description,
+        )
+        for description in ATTRIBUTE_BINARY_SENSORS
+        for device in controller.api.devices.all.values()
+        if (
+            description.filter_fn(device)
+            and not (isinstance(device, libSensor) and device.device_subtype in SENSOR_SUBTYPE_BLACKLIST)
+            and device.has_state
+        )
     )
 
-    # Create "virtual" problem sensors for Alarm.com sensors and locks.
-    async_add_entities(
-        ADCIProblemSensor(controller, controller.devices.get("entity_data", {}).get(malfunction_id))  # type: ignore
-        for malfunction_id in controller.devices.get("malfunction_ids", [])
-    )
 
-
-class ADCIBinarySensor(ADCIEntity, BinarySensorEntity):  # type: ignore
+class BinarySensor(HardwareBaseDevice, BinarySensorEntity):  # type: ignore
     """Binary sensor device class."""
 
-    def __init__(
-        self, controller: ADCIController, device_data: adci.ADCISensorData
-    ) -> None:
+    _device: libSensor
+
+    def __init__(self, controller: AlarmIntegrationController, device: AllDevices_t) -> None:
         """Pass coordinator to CoordinatorEntity."""
-        super().__init__(controller, device_data)
+        super().__init__(controller, device)
 
-        self._device_subtype_raw: Enum | None = self._device.get("device_subtype")
-        self._device: adci.ADCISensorData = device_data
+    @property
+    def device_type_name(self) -> str:
+        """Return human readable device type name based on device class."""
 
-        log.debug(
-            "%s: Initializing Alarm.com sensor entity for sensor %s.",
-            __name__,
-            self.unique_id,
-        )
+        return str(self.device_class.value.replace("_", " ").title()) if self.device_class else "Sensor"
+
+    @property
+    def device_class(self) -> BinarySensorDeviceClass | None:
+        """Return the class of this sensor, from DEVICE_CLASSES."""
+
+        # Contact sensor:
 
         # Try to determine whether contact sensor is for a window or door by matching strings.
-        # Do this in __init__ because it's expensive.
-        # We don't want to run this logic on every update.
-        self._derived_class: bsdc = None
-        if self._device_subtype_raw == ADCSensorSubtype.CONTACT_SENSOR:
+        derived_class: BinarySensorDeviceClass = None
+        if (raw_subtype := self._device.device_subtype) in [
+            libSensor.Subtype.CONTACT_SENSOR,
+            libSensor.Subtype.CONTACT_SHOCK_SENSOR,
+        ]:
             for _, word in LANG_DOOR:
                 if (
                     re.search(
                         word,
-                        device_data["name"],
+                        str(self._device.name),
                         re.IGNORECASE,
                     )
                     is not None
                 ):
-                    self._derived_class = bsdc.DOOR
+                    derived_class = BinarySensorDeviceClass.DOOR
             for _, word in LANG_WINDOW:
                 if (
                     re.search(
                         word,
-                        device_data["name"],
+                        str(self._device.name),
                         re.IGNORECASE,
                     )
                     is not None
                 ):
-                    self._derived_class = bsdc.WINDOW
+                    derived_class = BinarySensorDeviceClass.WINDOW
 
-    @property
-    def device_class(self) -> bsdc:
-        """Return type of binary sensor."""
+        if derived_class is not None and raw_subtype in [
+            libSensor.Subtype.CONTACT_SENSOR,
+            libSensor.Subtype.CONTACT_SHOCK_SENSOR,
+        ]:
+            return derived_class
 
-        if (
-            self._derived_class is not None
-            and self._device_subtype_raw == ADCSensorSubtype.CONTACT_SENSOR
-        ):
-            return self._derived_class
-        if self._device_subtype_raw == ADCSensorSubtype.SMOKE_DETECTOR:
-            return bsdc.SMOKE
-        if self._device_subtype_raw == ADCSensorSubtype.CO_DETECTOR:
-            return bsdc.CO
-        if self._device_subtype_raw == ADCSensorSubtype.PANIC_BUTTON:
-            return bsdc.SAFETY
-        if self._device_subtype_raw in [
-            ADCSensorSubtype.GLASS_BREAK_DETECTOR,
-            ADCSensorSubtype.PANEL_GLASS_BREAK_DETECTOR,
+        # Water sensor:
+
+        if isinstance(self._device, libWaterSensor):
+            return BinarySensorDeviceClass.MOISTURE
+
+        # All other sensors:
+
+        if raw_subtype == libSensor.Subtype.SMOKE_DETECTOR:
+            return BinarySensorDeviceClass.SMOKE
+        if raw_subtype == libSensor.Subtype.CO_DETECTOR:
+            return BinarySensorDeviceClass.CO
+        if raw_subtype == libSensor.Subtype.PANIC_BUTTON:
+            return BinarySensorDeviceClass.SAFETY
+        if raw_subtype in [
+            libSensor.Subtype.GLASS_BREAK_DETECTOR,
+            libSensor.Subtype.PANEL_GLASS_BREAK_DETECTOR,
         ]:
-            return bsdc.VIBRATION
-        if self._device_subtype_raw in [
-            ADCSensorSubtype.MOTION_SENSOR,
-            ADCSensorSubtype.PANEL_MOTION_SENSOR,
+            return BinarySensorDeviceClass.VIBRATION
+        if raw_subtype in [
+            libSensor.Subtype.MOTION_SENSOR,
+            libSensor.Subtype.PANEL_MOTION_SENSOR,
         ]:
-            return bsdc.MOTION
-        if self._device_subtype_raw == ADCSensorSubtype.FREEZE_SENSOR:
-            return bsdc.COLD
+            return BinarySensorDeviceClass.MOTION
+        if raw_subtype == libSensor.Subtype.FREEZE_SENSOR:
+            return BinarySensorDeviceClass.COLD
 
         return None
 
     @property
-    def icon(self) -> str | None:
-        """Return the icon to use in the frontend, if any."""
-        if self.device_class in [bsdc.SMOKE, bsdc.CO, bsdc.GAS]:
-            if not self.available:
-                return "mdi:smoke-detector-variant-off"
-            if self.is_on:
-                return "mdi:smoke-detector-variant-alert"
-            return "mdi:smoke-detector-variant"
-        if hasattr(self, "_attr_icon"):
-            return self._attr_icon  # type: ignore
-        if hasattr(self, "entity_description"):
-            return self.entity_description.icon  # type: ignore
-        return None
+    def available(self) -> bool:
+        """Return True if entity is available."""
+
+        return self.is_on is not None
 
     @property
     def is_on(self) -> bool | None:
-        """Return the state of the sensor."""
+        """Return true if the binary sensor is on."""
 
-        if self._device.get("state") in [
-            ADCSensor.DeviceState.CLOSED,
-            ADCSensor.DeviceState.IDLE,
-            ADCSensor.DeviceState.DRY,
-        ]:
-            return False
+        # LOGGER.info(
+        #     "Processing state %s for %s",
+        #     self._device.state,
+        #     self.name or self._device.name,
+        # )
 
-        if self._device.get("state") in [
-            ADCSensor.DeviceState.OPEN,
-            ADCSensor.DeviceState.ACTIVE,
-            ADCSensor.DeviceState.WET,
-        ]:
-            return True
+        match self._device.state:
+            case libSensor.DeviceState.CLOSED | libSensor.DeviceState.IDLE | libWaterSensor.DeviceState.DRY:
+                return False
+            case libSensor.DeviceState.OPEN | libSensor.DeviceState.ACTIVE | libWaterSensor.DeviceState.WET:
+                return True
 
+        LOGGER.info(
+            "Cannot determine binary sensor state for sensor %s. Found raw state of %s.",
+            self._attr_name,
+            self._device.state,
+        )
         return None
 
 
-class ADCIBatterySensor(ADCIEntity, BinarySensorEntity):  # type: ignore
-    """Returns low battery state for Alarm.com sensors and locks."""
+class AttributeBinarySensor(AttributeBaseDevice, BinarySensorEntity):  # type: ignore
+    """Attribute binary sensor."""
+
+    entity_description: AlarmdotcomAttributeDescription
 
     def __init__(
-        self, controller: ADCIController, device_data: adci.ADCISensorData
+        self,
+        controller: AlarmIntegrationController,
+        device: AllDevices_t,
+        description: AlarmdotcomAttributeDescription,
     ) -> None:
         """Pass coordinator to CoordinatorEntity."""
-        super().__init__(controller, device_data)
 
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_device_class = bsdc.BATTERY
+        super().__init__(controller, device, description)
 
     @property
-    def device_info(self) -> dict[str, Any]:
-        """Return info to categorize this entity as a device."""
+    def extra_state_attributes(self) -> Mapping[str, Any] | None:
+        """Return the state attributes of the entity."""
 
-        # Associate with parent device.
-        return {
-            "identifiers": {(adci.DOMAIN, self._device.get("parent_id"))},
-        }
+        extra_attribs = {}.update(super().extra_state_attributes)
+
+        if extra_attribs := self.entity_description.extra_attribs_fn(self):
+            extra_attribs.update(extra_attribs)
+
+        return extra_attribs
 
     @property
     def is_on(self) -> bool | None:
-        """Return the state of the sensor."""
+        """Return true if the binary sensor is on."""
 
-        if self._device.get("state") in [True, False]:
-            return bool(self._device.get("state"))
-
-        return None
-
-
-class ADCIProblemSensor(ADCIEntity, BinarySensorEntity):  # type: ignore
-    """Returns malfunction state for Alarm.com sensors and locks."""
-
-    def __init__(
-        self, controller: ADCIController, device_data: adci.ADCISensorData
-    ) -> None:
-        """Pass coordinator to CoordinatorEntity."""
-        super().__init__(controller, device_data)
-
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_device_class = bsdc.PROBLEM
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return info to categorize this entity as a device."""
-
-        # Associate with parent device.
-        return {
-            "identifiers": {(adci.DOMAIN, self._device.get("parent_id"))},
-        }
-
-    @property
-    def is_on(self) -> bool | None:
-        """Return the state of the sensor."""
-
-        if self._device.get("state") in [True, False]:
-            return bool(self._device.get("state"))
-
-        return None
+        return self.entity_description.value_fn(self)

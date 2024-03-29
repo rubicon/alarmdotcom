@@ -1,64 +1,46 @@
 """Interfaces with Alarm.com alarm control panels."""
+
 from __future__ import annotations
 
-from collections.abc import Callable
 import logging
 import re
+from collections.abc import Mapping
+from typing import Any
 
-from homeassistant import config_entries
 from homeassistant import core
-from homeassistant.components import alarm_control_panel
-from homeassistant.components import persistent_notification
-from homeassistant.components.alarm_control_panel import AlarmControlPanelEntity
-from homeassistant.components.alarm_control_panel import SUPPORT_ALARM_ARM_AWAY
-from homeassistant.components.alarm_control_panel import SUPPORT_ALARM_ARM_HOME
-from homeassistant.components.alarm_control_panel import SUPPORT_ALARM_ARM_NIGHT
+from homeassistant.components.alarm_control_panel import (
+    AlarmControlPanelEntity,
+    AlarmControlPanelEntityFeature,
+    CodeFormat,
+)
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import STATE_ALARM_ARMED_AWAY
-from homeassistant.const import STATE_ALARM_ARMED_HOME
-from homeassistant.const import STATE_ALARM_ARMED_NIGHT
-from homeassistant.const import STATE_ALARM_DISARMED
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.entity_platform import DiscoveryInfoType
-from homeassistant.helpers.typing import ConfigType
-from pyalarmdotcomajax.entities import ADCPartition
+from homeassistant.const import (
+    STATE_ALARM_ARMED_AWAY,
+    STATE_ALARM_ARMED_HOME,
+    STATE_ALARM_ARMED_NIGHT,
+    STATE_ALARM_ARMING,
+    STATE_ALARM_DISARMED,
+    STATE_ALARM_DISARMING,
+)
+from homeassistant.helpers.entity_platform import AddEntitiesCallback, DiscoveryInfoType
+from pyalarmdotcomajax.devices.partition import Partition as libPartition
+from pyalarmdotcomajax.exceptions import NotAuthorized
 
-from . import ADCIEntity
-from . import const as adci
-from .const import ADCIPartitionData
-from .controller import ADCIController
+from .base_device import HardwareBaseDevice
+from .const import (
+    CONF_ARM_AWAY,
+    CONF_ARM_CODE,
+    CONF_ARM_HOME,
+    CONF_ARM_NIGHT,
+    CONF_FORCE_BYPASS,
+    CONF_NO_ENTRY_DELAY,
+    CONF_SILENT_ARM,
+    DATA_CONTROLLER,
+    DOMAIN,
+)
+from .controller import AlarmIntegrationController
 
-log = logging.getLogger(__name__)
-
-
-async def async_setup_platform(
-    hass: HomeAssistant,
-    config: ConfigType,
-    async_add_entities: AddEntitiesCallback,  # pylint: disable=unused-argument
-    discovery_info: DiscoveryInfoType | None = None,  # pylint: disable=unused-argument
-) -> None:
-    """Set up the legacy platform."""
-
-    log.debug(
-        "Alarmdotcom: Detected legacy platform config entry. Converting to Home"
-        " Assistant config flow."
-    )
-
-    hass.async_create_task(
-        hass.config_entries.flow.async_init(
-            adci.DOMAIN, context={"source": config_entries.SOURCE_IMPORT}, data=config
-        )
-    )
-
-    log.warning(adci.MIGRATE_MSG_ALERT)
-
-    persistent_notification.async_create(
-        hass,
-        adci.MIGRATE_MSG_ALERT,
-        title="Alarm.com Updated",
-        notification_id="alarmdotcom_migration",
-    )
+LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -69,173 +51,156 @@ async def async_setup_entry(
 ) -> None:
     """Set up the sensor platform and create a master device."""
 
-    controller: ADCIController = hass.data[adci.DOMAIN][config_entry.entry_id]
+    controller: AlarmIntegrationController = hass.data[DOMAIN][config_entry.entry_id][DATA_CONTROLLER]
 
     async_add_entities(
-        ADCIControlPanel(
-            controller, controller.devices.get("entity_data", {}).get(partition_id)  # type: ignore
+        AlarmControlPanel(
+            controller=controller,
+            device=device,
         )
-        for partition_id in controller.devices.get("partition_ids", [])
+        for device in controller.api.devices.partitions.values()
     )
 
 
-class ADCIControlPanel(ADCIEntity, AlarmControlPanelEntity):  # type: ignore
+class AlarmControlPanel(HardwareBaseDevice, AlarmControlPanelEntity):  # type: ignore
     """Alarm.com Alarm Control Panel entity."""
 
+    device_type_name: str = "Alarm Control Panel"
+    _device: libPartition
+
     def __init__(
-        self, controller: ADCIController, device_data: ADCIPartitionData
+        self,
+        controller: AlarmIntegrationController,
+        device: libPartition,
     ) -> None:
         """Pass coordinator to CoordinatorEntity."""
 
-        super().__init__(controller, device_data)
+        super().__init__(controller, device)
 
-        self._arm_code: str | None = self._controller.config_entry.options.get(
-            adci.CONF_ARM_CODE
+        self._attr_code_format = (
+            (
+                CodeFormat.NUMBER
+                if (isinstance(arm_code, str) and re.search("^\\d+$", arm_code))
+                else CodeFormat.TEXT
+            )
+            if (arm_code := controller.options.get(CONF_ARM_CODE))
+            else None
         )
 
-        self._device: ADCIPartitionData = device_data
-
-        self._conf_arm_home: set = set(
-            self._controller.config_entry.options.get(adci.CONF_ARM_HOME, {})
-        )
-        self._conf_arm_away: set = set(
-            self._controller.config_entry.options.get(adci.CONF_ARM_AWAY, {})
-        )
-        self._conf_arm_night: set = set(
-            self._controller.config_entry.options.get(adci.CONF_ARM_NIGHT, {})
+        self._attr_supported_features = (
+            AlarmControlPanelEntityFeature.ARM_HOME | AlarmControlPanelEntityFeature.ARM_AWAY
         )
 
-        try:
-            self.async_arm_home_callback: Callable = self._device[
-                "async_arm_home_callback"
-            ]
-            self.async_arm_away_callback: Callable = self._device[
-                "async_arm_away_callback"
-            ]
-            self.async_arm_night_callback: Callable = self._device[
-                "async_arm_night_callback"
-            ]
-            self.async_disarm_callback: Callable = self._device["async_disarm_callback"]
-        except KeyError:
-            log.error("Failed to initialize control functions for %s.", self.unique_id)
-            self._attr_available = False
-
-        log.debug(
-            "%s: Initializing Alarm.com control panel entity for partition %s.",
-            __name__,
-            self.unique_id,
-        )
+        if self._device.supports_night_arming:
+            self._attr_supported_features |= AlarmControlPanelEntityFeature.ARM_NIGHT
 
     @property
-    def code_format(
-        self,
-    ) -> alarm_control_panel.FORMAT_NUMBER | alarm_control_panel.FORMAT_TEXT | None:
-        """Return one or more digits/characters."""
-        if self._arm_code in [None, ""]:
-            return None
-        if isinstance(self._arm_code, str) and re.search("^\\d+$", self._arm_code):
-            return alarm_control_panel.FORMAT_NUMBER
-        return alarm_control_panel.FORMAT_TEXT
+    def extra_state_attributes(self) -> Mapping[str, Any] | None:
+        """Return the state attributes of the entity."""
+
+        return {
+            "uncleared_issues": str(self._device.uncleared_issues),
+            **getattr(super(), "extra_state_attributes", {}),
+        }
 
     @property
-    def state(self) -> str:
+    def state(self) -> str | None:
         """Return the state of the device."""
 
-        if self._device.get("state") is None:
-            return adci.STATE_MALFUNCTION
-        if self._device.get("state") == ADCPartition.DeviceState.DISARMED:
-            return str(STATE_ALARM_DISARMED)
-        if self._device["state"] == ADCPartition.DeviceState.ARMED_STAY:
-            return str(STATE_ALARM_ARMED_HOME)
-        if self._device["state"] == ADCPartition.DeviceState.ARMED_AWAY:
-            return str(STATE_ALARM_ARMED_AWAY)
-        if self._device["state"] == ADCPartition.DeviceState.ARMED_NIGHT:
-            return str(STATE_ALARM_ARMED_NIGHT)
+        if self._device.malfunction:
+            return None
 
-        return str(adci.STATE_MALFUNCTION)
+        if self._device.state == self._device.desired_state:
+            match self._device.state:
+                case libPartition.DeviceState.DISARMED:
+                    return str(STATE_ALARM_DISARMED)
+                case libPartition.DeviceState.ARMED_STAY:
+                    return str(STATE_ALARM_ARMED_HOME)
+                case libPartition.DeviceState.ARMED_AWAY:
+                    return str(STATE_ALARM_ARMED_AWAY)
+                case libPartition.DeviceState.ARMED_NIGHT:
+                    return str(STATE_ALARM_ARMED_NIGHT)
+        else:
+            match self._device.desired_state:
+                case libPartition.DeviceState.DISARMED:
+                    return str(STATE_ALARM_DISARMING)
+                case (
+                    libPartition.DeviceState.ARMED_STAY
+                    | libPartition.DeviceState.ARMED_AWAY
+                    | libPartition.DeviceState.ARMED_NIGHT
+                ):
+                    return str(STATE_ALARM_ARMING)
 
-    @property
-    def extra_state_attributes(self) -> dict:
-        """Return entity specific state attributes."""
-
-        desired_state_name = None
-        if desired_state := self._device.get("desired_state"):
-            desired_state_name = desired_state.name.title()
-
-        return dict(
-            (super().extra_state_attributes or {})
-            | {
-                "desired_state": desired_state_name,
-                "uncleared_issues": self._device.get("uncleared_issues"),
-            }
+        LOGGER.error(
+            f"Cannot determine state. Found raw state of {self._device.state} and desired state of"
+            f" {self._device.desired_state}."
         )
 
-    @property
-    def supported_features(self) -> int:
-        """Return the list of supported features."""
-        return (
-            int(SUPPORT_ALARM_ARM_HOME)
-            | int(SUPPORT_ALARM_ARM_AWAY)
-            | int(SUPPORT_ALARM_ARM_NIGHT)
-        )
+        return None
 
     async def async_alarm_disarm(self, code: str | None = None) -> None:
         """Send disarm command."""
         if self._validate_code(code):
             try:
-                await self.async_disarm_callback()
-            except PermissionError:
+                await self._device.async_disarm()
+            except NotAuthorized:
                 self._show_permission_error("disarm")
-
-            await self._controller.async_coordinator_update()
 
     async def async_alarm_arm_night(self, code: str | None = None) -> None:
         """Send arm night command."""
 
+        arm_options = self._controller.options.get(CONF_ARM_NIGHT, {})
+
         if self._validate_code(code):
             try:
-                await self.async_arm_night_callback(
-                    force_bypass="bypass" in self._conf_arm_night,
-                    no_entry_delay="delay" not in self._conf_arm_night,
-                    silent_arming="silent" in self._conf_arm_night,
+                await self._device.async_arm_night(
+                    force_bypass=CONF_FORCE_BYPASS in arm_options,
+                    no_entry_delay=CONF_NO_ENTRY_DELAY in arm_options,
+                    silent_arming=CONF_SILENT_ARM in arm_options,
                 )
-            except PermissionError:
+            except NotAuthorized:
                 self._show_permission_error("arm_night")
-
-            await self._controller.async_coordinator_update()
 
     async def async_alarm_arm_home(self, code: str | None = None) -> None:
         """Send arm home command."""
 
+        arm_options = self._controller.options.get(CONF_ARM_HOME, {})
+
         if self._validate_code(code):
             try:
-                await self.async_arm_home_callback(
-                    force_bypass="bypass" in self._conf_arm_home,
-                    no_entry_delay="delay" not in self._conf_arm_home,
-                    silent_arming="silent" in self._conf_arm_home,
+                await self._device.async_arm_stay(
+                    force_bypass=CONF_FORCE_BYPASS in arm_options,
+                    no_entry_delay=CONF_NO_ENTRY_DELAY in arm_options,
+                    silent_arming=CONF_SILENT_ARM in arm_options,
                 )
-            except PermissionError:
+            except NotAuthorized:
                 self._show_permission_error("arm_home")
-
-            await self._controller.async_coordinator_update()
 
     async def async_alarm_arm_away(self, code: str | None = None) -> None:
         """Send arm away command."""
+
+        arm_options = self._controller.options.get(CONF_ARM_AWAY, {})
+
         if self._validate_code(code):
             try:
-                await self.async_arm_away_callback(
-                    force_bypass="bypass" in self._conf_arm_away,
-                    no_entry_delay="delay" not in self._conf_arm_away,
-                    silent_arming="silent" in self._conf_arm_away,
+                await self._device.async_arm_away(
+                    force_bypass=CONF_FORCE_BYPASS in arm_options,
+                    no_entry_delay=CONF_NO_ENTRY_DELAY in arm_options,
+                    silent_arming=CONF_SILENT_ARM in arm_options,
                 )
-            except PermissionError:
+            except NotAuthorized:
                 self._show_permission_error("arm_away")
 
-            await self._controller.async_coordinator_update()
+    #
+    # Helpers
+    #
 
     def _validate_code(self, code: str | None) -> bool | str:
         """Validate given code."""
-        check: bool | str = self._arm_code in [None, ""] or code == self._arm_code
+        check: bool | str = (arm_code := self._controller.options.get(CONF_ARM_CODE)) in [
+            None,
+            "",
+        ] or code == arm_code
         if not check:
-            log.warning("Wrong code entered")
+            LOGGER.warning("Wrong code entered.")
         return check

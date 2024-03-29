@@ -1,25 +1,27 @@
 """Alarmdotcom implementation of an HA cover (garage door)."""
+
 from __future__ import annotations
 
-from collections.abc import Callable
 import logging
 from typing import Any
 
 from homeassistant import core
-from homeassistant.components.cover import CoverDeviceClass
-from homeassistant.components.cover import CoverEntity
-from homeassistant.components.cover import SUPPORT_CLOSE
-from homeassistant.components.cover import SUPPORT_OPEN
+from homeassistant.components.cover import (
+    CoverDeviceClass,
+    CoverEntity,
+    CoverEntityFeature,
+)
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.entity_platform import DiscoveryInfoType
-from pyalarmdotcomajax.entities import ADCGarageDoor
+from homeassistant.helpers.entity_platform import AddEntitiesCallback, DiscoveryInfoType
+from pyalarmdotcomajax.devices.garage_door import GarageDoor as libGarageDoor
+from pyalarmdotcomajax.devices.gate import Gate as libGate
+from pyalarmdotcomajax.exceptions import NotAuthorized
 
-from . import ADCIEntity
-from . import const as adci
-from .controller import ADCIController
+from .base_device import HardwareBaseDevice
+from .const import DATA_CONTROLLER, DOMAIN
+from .controller import AlarmIntegrationController
 
-log = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -28,68 +30,92 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Set up the sensor platform."""
+    """Set up the cover platform."""
 
-    controller: ADCIController = hass.data[adci.DOMAIN][config_entry.entry_id]
+    controller: AlarmIntegrationController = hass.data[DOMAIN][config_entry.entry_id][DATA_CONTROLLER]
 
     async_add_entities(
-        ADCICover(controller, controller.devices.get("entity_data", {}).get(garage_id))  # type: ignore
-        for garage_id in controller.devices.get("garage_door_ids", [])
+        Cover(
+            controller=controller,
+            device=device,
+        )
+        for device in list(controller.api.devices.garage_doors.values())
+        + list(controller.api.devices.gates.values())
     )
 
 
-class ADCICover(ADCIEntity, CoverEntity):  # type: ignore
+class Cover(HardwareBaseDevice, CoverEntity):  # type: ignore
     """Integration Cover Entity."""
 
+    _device_type_name: str = "Garage Door"
+    _device: libGarageDoor | libGate
+
     def __init__(
-        self, controller: ADCIController, device_data: adci.ADCIGarageDoorData
+        self,
+        controller: AlarmIntegrationController,
+        device: libGarageDoor | libGate,
     ) -> None:
         """Pass coordinator to CoordinatorEntity."""
-        super().__init__(controller, device_data)
+        super().__init__(controller, device)
 
-        self._device: adci.ADCIGarageDoorData = device_data
-        self._attr_device_class: CoverDeviceClass = CoverDeviceClass.GARAGE
-        self._attr_supported_features = SUPPORT_OPEN | SUPPORT_CLOSE
+        self._attr_device_class: CoverDeviceClass = (
+            CoverDeviceClass.GARAGE if isinstance(device, libGarageDoor) else CoverDeviceClass.GATE
+        )
 
-        try:
-            self.async_open_callback: Callable = self._device["async_open_callback"]
-            self.async_close_callback: Callable = self._device["async_close_callback"]
-        except KeyError:
-            log.error("Failed to initialize control functions for %s.", self.unique_id)
-            self._attr_available = False
+        self._attr_supported_features = CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE
 
-        log.debug(
-            "%s: Initializing Alarm.com garage door entity for garage door %s.",
-            __name__,
-            self.unique_id,
+    @property
+    def is_closing(self) -> bool | None:
+        """Return true if lock is unlocking."""
+
+        return (
+            not self._device.malfunction
+            and self._device.state != self._device.desired_state
+            and self._device.desired_state in [libGarageDoor.DeviceState.CLOSED, libGate.DeviceState.CLOSED]
+        )
+
+    @property
+    def is_opening(self) -> bool | None:
+        """Return true if lock is unlocking."""
+
+        return (
+            not self._device.malfunction
+            and self._device.state != self._device.desired_state
+            and self._device.desired_state in [libGarageDoor.DeviceState.OPEN, libGate.DeviceState.OPEN]
         )
 
     @property
     def is_closed(self) -> bool | None:
-        """Return if the cover is closed or not."""
+        """Return true if lock is locked."""
 
-        if self._device.get("state") == ADCGarageDoor.DeviceState.OPEN:
-            return False
+        LOGGER.info("Processing is_closed %s for %s", self._device.state, self.name or self._device.name)
 
-        if self._device.get("state") == ADCGarageDoor.DeviceState.CLOSED:
-            return True
+        if not self._device.malfunction:
+            match self._device.state:
+                case libGarageDoor.DeviceState.OPEN | libGate.DeviceState.OPEN:
+                    return False
+                case libGarageDoor.DeviceState.CLOSED | libGate.DeviceState.CLOSED:
+                    return True
+
+            LOGGER.error(
+                "Cannot determine cover state. Found raw state of %s.",
+                self._device.state,
+            )
 
         return None
 
     async def async_open_cover(self, **kwargs: Any) -> None:
         """Open the cover."""
-        try:
-            await self.async_open_callback()
-        except PermissionError:
-            self._show_permission_error("open")
 
-        await self._controller.async_coordinator_update(critical=False)
+        try:
+            await self._device.async_open()
+        except NotAuthorized:
+            self._show_permission_error("open")
 
     async def async_close_cover(self, **kwargs: Any) -> None:
         """Close the cover."""
-        try:
-            await self.async_close_callback()
-        except PermissionError:
-            self._show_permission_error("close")
 
-        await self._controller.async_coordinator_update(critical=False)
+        try:
+            await self._device.async_close()
+        except NotAuthorized:
+            self._show_permission_error("close")

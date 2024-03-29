@@ -1,21 +1,52 @@
-"""Alarmdotcom implementation of an HA light."""
+"""Alarmdotcom implementation of an HA button."""
+
 from __future__ import annotations
 
 import logging
-from typing import Any
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Final
 
 from homeassistant import core
-from homeassistant.components.button import ButtonEntity
+from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.entity_platform import DiscoveryInfoType
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback, DiscoveryInfoType
+from pyalarmdotcomajax.devices.registry import AllDevices_t
 
-from . import ADCIEntity
-from . import const as adci
-from .controller import ADCIController
+from .base_device import AttributeBaseDevice
+from .const import DATA_CONTROLLER, DEBUG_REQ_EVENT, DOMAIN, SENSOR_SUBTYPE_BLACKLIST
+from .controller import AlarmIntegrationController
 
-log = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class AlarmdotcomButtonDescriptionMixin:
+    """Functions for an attribute entity."""
+
+    filter_fn: Callable[[AllDevices_t], bool]
+    press_fn: Callable[[HomeAssistant, AllDevices_t], Any]
+
+
+@dataclass
+class AlarmdotcomButtonDescription(ButtonEntityDescription, AlarmdotcomButtonDescriptionMixin):  # type: ignore
+    """Describes a button entity."""
+
+
+ATTRIBUTE_BUTTONS: Final = [
+    AlarmdotcomButtonDescription(
+        key="debug",
+        name="Debug",
+        has_entity_name=True,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        press_fn=lambda hass, device: hass.bus.async_fire(DEBUG_REQ_EVENT, {"device_id": device.id_}),
+        filter_fn=lambda device: device.has_state is True
+        and (getattr(device, "device_subtype") not in SENSOR_SUBTYPE_BLACKLIST),
+        icon="mdi:bug",
+    ),
+]
 
 
 async def async_setup_entry(
@@ -26,47 +57,23 @@ async def async_setup_entry(
 ) -> None:
     """Set up the button platform."""
 
-    controller: ADCIController = hass.data[adci.DOMAIN][config_entry.entry_id]
+    controller: AlarmIntegrationController = hass.data[DOMAIN][config_entry.entry_id][DATA_CONTROLLER]
 
     async_add_entities(
-        ADCIDebugButton(controller, controller.devices.get("entity_data", {}).get(button_id))  # type: ignore
-        for button_id in controller.devices.get("debug_ids", [])
+        DebugButton(controller=controller, device=device, description=description)
+        for description in ATTRIBUTE_BUTTONS
+        for device in controller.api.devices.all.values()
+        if description.filter_fn(device)
     )
 
 
-class ADCIDebugButton(ADCIEntity, ButtonEntity):  # type: ignore
-    """Integration Light Entity."""
+class DebugButton(AttributeBaseDevice, ButtonEntity):  # type: ignore
+    """Integration button entity."""
 
-    _attr_icon = "mdi:bug"
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-
-    def __init__(
-        self, controller: ADCIController, device_data: adci.ADCIDebugButtonData
-    ) -> None:
-        """Pass coordinator to CoordinatorEntity."""
-        super().__init__(controller, device_data)
-
-        self._device: adci.ADCIDebugButtonData = device_data
-        self._config_entry: ConfigEntry = controller.config_entry
-
-        log.debug(
-            "%s: Initializing Alarm.com debug entity for %s.",
-            __name__,
-            self.unique_id,
-        )
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return info to categorize this entity as a device."""
-
-        # Associate with parent device.
-        return {
-            "identifiers": {(adci.DOMAIN, self._device.get("parent_id"))},
-        }
+    entity_description: AlarmdotcomButtonDescription
+    _attr_available: bool = True
 
     async def async_press(self) -> None:
         """Handle the button press."""
 
-        self._controller.hass.bus.async_fire(
-            adci.DEBUG_REQ_EVENT, {"device_id": self._device.get("parent_id")}
-        )
+        self.entity_description.press_fn(self.hass, self._device)

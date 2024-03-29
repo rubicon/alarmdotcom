@@ -1,28 +1,26 @@
 """Alarmdotcom implementation of an HA lock."""
+
 from __future__ import annotations
 
-from collections.abc import Callable
 import logging
 import re
 from typing import Any
 
-from homeassistant import config_entries
-from homeassistant import core
-from homeassistant.components import lock
+from homeassistant import config_entries, core
 from homeassistant.components import persistent_notification
 from homeassistant.components.lock import LockEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.entity_platform import DiscoveryInfoType
+from homeassistant.helpers.entity_platform import AddEntitiesCallback, DiscoveryInfoType
 from homeassistant.helpers.typing import ConfigType
-from pyalarmdotcomajax.entities import ADCLock
+from pyalarmdotcomajax.devices.lock import Lock as libLock
+from pyalarmdotcomajax.exceptions import NotAuthorized
 
-from . import ADCIEntity
-from . import const as adci
-from .controller import ADCIController
+from .base_device import HardwareBaseDevice
+from .const import CONF_ARM_CODE, DATA_CONTROLLER, DOMAIN, MIGRATE_MSG_ALERT
+from .controller import AlarmIntegrationController
 
-log = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_platform(
@@ -33,22 +31,17 @@ async def async_setup_platform(
 ) -> None:
     """Set up the legacy platform."""
 
-    log.debug(
-        "Alarmdotcom: Detected legacy lock config entry. Converting to Home"
-        " Assistant config flow."
-    )
+    LOGGER.debug("Alarmdotcom: Detected legacy lock config entry. Converting to Home Assistant config flow.")
 
     hass.async_create_task(
-        hass.config_entries.flow.async_init(
-            adci.DOMAIN, context={"source": config_entries.SOURCE_IMPORT}, data=config
-        )
+        hass.config_entries.flow.async_init(DOMAIN, context={"source": config_entries.SOURCE_IMPORT}, data=config)
     )
 
-    log.warning(adci.MIGRATE_MSG_ALERT)
+    LOGGER.warning(MIGRATE_MSG_ALERT)
 
     persistent_notification.async_create(
         hass,
-        adci.MIGRATE_MSG_ALERT,
+        MIGRATE_MSG_ALERT,
         title="Alarm.com Updated",
         notification_id="alarmdotcom_migration",
     )
@@ -60,64 +53,80 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Set up the sensor platform."""
+    """Set up the lock platform."""
 
-    controller: ADCIController = hass.data[adci.DOMAIN][config_entry.entry_id]
+    controller: AlarmIntegrationController = hass.data[DOMAIN][config_entry.entry_id][DATA_CONTROLLER]
 
     async_add_entities(
-        ADCILock(controller, controller.devices.get("entity_data", {}).get(lock_id))  # type: ignore
-        for lock_id in controller.devices.get("lock_ids", [])
+        Lock(
+            controller=controller,
+            device=device,
+        )
+        for device in controller.api.devices.locks.values()
     )
 
 
-class ADCILock(ADCIEntity, LockEntity):  # type: ignore
+class Lock(HardwareBaseDevice, LockEntity):  # type: ignore
     """Integration Lock Entity."""
 
-    def __init__(
-        self, controller: ADCIController, device_data: adci.ADCILockData
-    ) -> None:
-        """Pass coordinator to CoordinatorEntity."""
-        super().__init__(controller, device_data)
-
-        self._arm_code: str | None = self._controller.config_entry.options.get(
-            "arm_code"
-        )
-
-        self._device: adci.ADCILockData = device_data
-
-        try:
-            self.async_lock_callback: Callable = self._device["async_lock_callback"]
-            self.async_unlock_callback: Callable = self._device["async_unlock_callback"]
-        except KeyError:
-            log.error("Failed to initialize control functions for %s.", self.unique_id)
-            self._attr_available = False
-
-        log.debug(
-            "%s: Initializing Alarm.com lock entity for lock %s.",
-            __name__,
-            self.unique_id,
-        )
+    _device_type_name: str = "Lock"
+    _device: libLock
 
     @property
     def code_format(self) -> str | None:
-        """Return one or more digits/characters."""
-        if self._arm_code is None:
-            return None
-        if isinstance(self._arm_code, str) and re.search("^\\d+$", self._arm_code):
-            return str(lock.ATTR_CODE_FORMAT)
-        return str(lock.ATTR_CODE_FORMAT)
+        """Return the format of the code."""
+
+        if code := self._controller.options.get(CONF_ARM_CODE):
+            code_patterns = [
+                r"^\d+$",  # Only digits
+                r"^\w\D+$",  # Only alpha
+                r"^\w+$",  # Alphanumeric
+            ]
+
+            for pattern in code_patterns:
+                if re.findall(pattern, code):
+                    return pattern
+
+            return "."  # All characters
+
+        return None
+
+    @property
+    def is_locking(self) -> bool | None:
+        """Return true if lock is locking."""
+
+        return (
+            not self._device.malfunction
+            and self._device.state == libLock.DeviceState.UNLOCKED
+            and self._device.desired_state == libLock.DeviceState.LOCKED
+        )
+
+    @property
+    def is_unlocking(self) -> bool | None:
+        """Return true if lock is unlocking."""
+
+        return (
+            not self._device.malfunction
+            and self._device.desired_state == libLock.DeviceState.UNLOCKED
+            and self._device.state == libLock.DeviceState.LOCKED
+        )
 
     @property
     def is_locked(self) -> bool | None:
-        """Return true if the lock is locked."""
+        """Return true if lock is locked."""
 
-        if not self._device.get("malfunction"):
+        # LOGGER.info("Processing is_locked %s for %s", self._device.state, self.name or self._device.name)
 
-            if self._device.get("state") == ADCLock.DeviceState.LOCKED:
-                return True
-
-            if self._device.get("state") == ADCLock.DeviceState.UNLOCKED:
-                return False
+        if not self._device.malfunction:
+            match self._device.state:
+                case libLock.DeviceState.LOCKED:
+                    return True
+                case libLock.DeviceState.UNLOCKED:
+                    return False
+                case _:
+                    LOGGER.error(
+                        f"Cannot determine whether {self.name} is locked. Found raw state of {self._device.state}."
+                    )
 
         return None
 
@@ -125,25 +134,28 @@ class ADCILock(ADCIEntity, LockEntity):  # type: ignore
         """Lock the lock."""
         if self._validate_code(kwargs.get("code")):
             try:
-                await self.async_lock_callback()
-            except PermissionError:
+                await self._device.async_lock()
+            except NotAuthorized:
                 self._show_permission_error("lock")
 
-            await self._controller.async_coordinator_update()
-
     async def async_unlock(self, **kwargs: Any) -> None:
-        """Lock the lock."""
+        """Unlock the lock."""
         if self._validate_code(kwargs.get("code")):
             try:
-                await self.async_unlock_callback()
-            except PermissionError:
+                await self._device.async_unlock()
+            except NotAuthorized:
                 self._show_permission_error("unlock")
 
-            await self._controller.async_coordinator_update()
+    #
+    # Helpers
+    #
 
-    def _validate_code(self, code: str | None) -> bool:
+    def _validate_code(self, code: str | None) -> bool | str:
         """Validate given code."""
-        check: bool = self._arm_code in [None, ""] or code == self._arm_code
+        check: bool | str = (arm_code := self._controller.options.get(CONF_ARM_CODE)) in [
+            None,
+            "",
+        ] or code == arm_code
         if not check:
-            log.warning("Wrong code entered")
+            LOGGER.warning("Wrong code entered.")
         return check
